@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, send_file, redirect, url_for
+from flask import Flask, jsonify, request, send_file, redirect, url_for, Response
 import os
 import pickle
 import json
@@ -7,6 +7,8 @@ from uuid import uuid4
 from flask_cors import CORS
 import subprocess
 import torch
+from hashlib import md5
+from simplediff import html_diff
 import seaborn as sns
 import matplotlib
 from werkzeug.utils import secure_filename
@@ -14,6 +16,7 @@ from flask_jwt_extended import (
     JWTManager, jwt_required, create_access_token,
     get_jwt_identity
 )
+from flask_compress import Compress
 from flask_sqlalchemy import SQLAlchemy
 
 matplotlib.use('Agg')
@@ -33,6 +36,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:////home/science/' + DB_NAME
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 CORS(app)
+Compress(app)
 jwt = JWTManager(app)
 
 from shared import db
@@ -97,7 +101,7 @@ def register():
     if os.path.isfile(DOCUMENTS_FOLDER + "/document-SAMPLE.document"):
         sample_document = get_document("SAMPLE")
         id = uuid4()
-        dbDocument = DBDocument(id=id, name="Sample", user=new_user)
+        dbDocument = DBDocument(id=id, name="Document", user=new_user)
         save_document(sample_document, id)
         db.session.add(dbDocument)
 
@@ -126,8 +130,12 @@ def addTranslation(root, translation):
             addTranslation(child, translation.slice())
             return
 
-    node = {"name": translation.words[0], "logprob": translation.log_probs[0], "children": [],
-            "attn": translation.attns[0], "candidates": translation.candidates[0], "is_golden": translation.is_golden,
+    node = {"name": translation.words[0],
+            "logprob": translation.log_probs[0],
+            "children": [],
+            "attn": translation.attns[0],
+            "candidates": translation.candidates[0],
+            "is_golden": translation.is_golden,
             "is_unk": translation.is_unk[0]}
     root["children"].append(node)
     addTranslation(node, translation.slice())
@@ -222,8 +230,13 @@ def correctTranslation():
             document.unk_map[key] = list(set(document.unk_map[key]) | set(document_unk_map[key]))
 
     sentence = document.sentences[int(sentence_id)]
+
+    if translation != sentence.translation:
+        sentence.diff = html_diff(sentence.translation[:-6].replace("@@ ", ""),
+                                  translation[:-6].replace("@@ ", ""))
     sentence.translation = translation
     sentence.corrected = True
+    sentence.flagged = False
     sentence.attention = attention
     sentence.beam = beam
 
@@ -237,7 +250,7 @@ def correctTranslation():
     save_document(document, document_id)
 
     from myseq2seq.train import train_iters
-    pairs = [sentence.source, sentence.translation[:-4]]
+    pairs = [sentence.source, sentence.translation[:-6]]
     print(pairs)
     # train_iters(seq2seq_model.encoder, seq2seq_model.decoder, seq2seq_model.input_lang, seq2seq_model.output_lang,
     #           pairs, batch_size=1, print_every=1, n_epochs=1)
@@ -258,9 +271,20 @@ def getSentences(document_id):
              "beam": sentence.beam,
              "score": sentence.score,
              "attention": sentence.attention,
-             "corrected": sentence.corrected})
+             "corrected": sentence.corrected,
+             "flagged": sentence.flagged,
+             "diff": sentence.diff if hasattr(sentence, "diff") else ""})
 
-    return jsonify(sentences)
+    old_etag = request.headers.get('If-None-Match', '')
+    data = json.dumps(sentences)
+    new_etag = md5(data.encode("utf-8")).hexdigest()
+
+    if old_etag == new_etag:
+        return "", 304
+    else:
+        res = jsonify(sentences)
+        res.headers["Etag"] = new_etag
+        return res
 
 
 @app.route("/api/documents", methods=["GET"])
@@ -321,6 +345,21 @@ def setCorrected(document_id, sentence_id):
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/documents/<document_id>/sentences/<sentence_id>/flagged", methods=["POST"])
+@jwt_required
+def setFlagged(document_id, sentence_id):
+    data = request.get_json()
+    flagged = data["flagged"]
+
+    document = get_document(document_id)
+
+    sentence = document.sentences[int(sentence_id)]
+    sentence.flagged = flagged
+    save_document(document, document_id)
+
+    return jsonify({"status": "ok"})
+
+
 @app.route("/upload", methods=['POST'])
 @jwt_required
 def documentUpload():
@@ -351,20 +390,27 @@ def documentUpload():
         extractor = DomainSpecificExtractor(source_file=filepath,
                                             train_source_file="myseq2seq/data/wmt14/train.tok.clean.bpe.32000.de",
                                             train_vocab_file="myseq2seq/train_vocab.pkl")
-        keyphrases = extractor.extract_keyphrases()
+        keyphrases = extractor.extract_keyphrases(n_results=30)
 
         scorer = Scorer()
 
-        for i, source in enumerate(sentences):
-            translation, attn, translations = seq2seq_model.translate(source)
+        print("Translating {} sentences".format(len(sentences)))
 
-            beam = translationsToTree(translations)
+        for i, source in enumerate(sentences):
+            translation, attn, translations = seq2seq_model.translate(source, beam_size=3, beam_length=1,
+                                                                      beam_coverage=1)
+
+            print("Translated {} of {}".format(i + 1, len(sentences)))
+
+            beam = translationsToTree(translations[:3])
 
             score = scorer.compute_scores(source, " ".join(translation), attn, keyphrases)
             score["order_id"] = i
             sentence = Sentence(i, source, " ".join(translation), attn, beam, score)
 
             document.sentences.append(sentence)
+
+        print("Finished translation")
 
         keyphrases = [{"name": k, "occurrences": f, "active": False} for (k, f) in keyphrases]
         document.keyphrases = keyphrases
@@ -481,14 +527,14 @@ def retrain(document_id):
     for sentence in document.sentences:
         # Remove EOS at end
         if sentence.corrected:
-            pairs.append([sentence.source, sentence.translation[:-4]])
+            pairs.append([sentence.source, " ".join(" ".join(sentence.translation).split(" ")[:-1])])
 
     if len(pairs) < 2:
         return jsonify({})
 
     from myseq2seq.train import retrain_iters
-    retrain_iters(seq2seq_model, pairs, [], batch_size=min(256, len(pairs)), print_every=1, n_epochs=20,
-                  learning_rate=0.00001)
+    retrain_iters(seq2seq_model, pairs, [], batch_size=1, print_every=1, n_epochs=1,
+                  learning_rate=0.0001)
 
     return jsonify({})
 
@@ -502,6 +548,7 @@ def retranslate(document_id):
                                         train_source_file="myseq2seq/data/wmt14/train.tok.clean.bpe.32000.de",
                                         train_vocab_file="myseq2seq/train_vocab.pkl")
     keyphrases = extractor.extract_keyphrases()
+    num_changes = 0
 
     for i, sentence in enumerate(document.sentences):
         if sentence.corrected:
@@ -514,13 +561,18 @@ def retranslate(document_id):
         score = scorer.compute_scores(sentence.source, " ".join(translation), attn, keyphrases)
         score["order_id"] = i
 
-        sentence.translation = " ".join(translation)
+        translation_text = " ".join(translation)
+        if translation_text != sentence.translation:
+            num_changes += 1
+            sentence.diff = html_diff(sentence.translation[:-4].replace("@@ ", ""),
+                                      translation_text[:-4].replace("@@ ", ""))
+        sentence.translation = translation_text
         sentence.beam = beam
         sentence.score = score
         sentence.attention = attn
 
     save_document(document, document_id)
-    return jsonify({})
+    return jsonify({"numChanges": num_changes})
 
 
 @app.route("/api/experiments/next", methods=['POST'])
@@ -580,16 +632,14 @@ def getExperimentData():
     if not user:
         return jsonify({}), 401
 
-    dbDocument = DBDocument.query.filter_by(user=user, name="Sample").first()
-    document = get_document(dbDocument.id)
-
+    users = User.query.all()
     result = []
+    for user in users:
+        if user.surveydata:
+            result.append(json.loads(user.surveydata))
 
-    for sentence in document.sentences:
-        result.append(sentence.experiment_metrics)
-
-    return jsonify({"metrics": result, "survey": json.loads(user.surveydata)})
+    return jsonify({"survey": result})
 
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=5000, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000, use_reloader=False, threaded=True)
